@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tank Trouble - Shake Remover
 // @namespace    https://github.com/invincibletanktrouble/TankTrouble-Shake-Remover
-// @version      1.1.0
+// @version      1.1.8
 // @description  Completely eliminates explosion and weapon screen shake in Tank Trouble.
 // @author       invincible
 // @match        https://tanktrouble.com/*
@@ -14,57 +14,86 @@
     'use strict';
 
     function patchGameSource(code) {
-        return code
-            .replace(/TANK_EXPLOSION_CAMERA_SHAKE\s*=\s*\d+/g, 'TANK_EXPLOSION_CAMERA_SHAKE=0')
-            .replace(/MAX_CAMERA_SHAKE\s*=\s*\d+/g, 'MAX_CAMERA_SHAKE=0')
-            .replace(/CAMERA_SHAKE\s*=\s*\d+/g, 'CAMERA_SHAKE=0')
-            .replace(/MINE_EXPLOSION_CAMERA_SHAKE\s*=\s*\d+/g, 'MINE_EXPLOSION_CAMERA_SHAKE=0')
-            .replace(/SPAWN_ZONE_UNSTABLE_SHAKE\s*=\s*\d+/g, 'SPAWN_ZONE_UNSTABLE_SHAKE=0')
-            .replace(/shake:\s*function\s*\(([^)]*)\)\s*\{/g, 'shake:function($1){return;');
+        let patched = code;
+
+        // Zero out all shake intensity constants (handles both "=" and ":")
+        const shakeKeys = [
+            'TANK_EXPLOSION_CAMERA_SHAKE',
+            'MAX_CAMERA_SHAKE',
+            'CAMERA_SHAKE',
+            'MINE_EXPLOSION_CAMERA_SHAKE',
+            'SPAWN_ZONE_UNSTABLE_SHAKE'
+        ];
+
+        for (const key of shakeKeys) {
+            const regex = new RegExp('(' + key + '\\s*[:=]\\s*)[0-9.]+', 'g');
+            patched = patched.replace(regex, (match, prefix) => prefix + '0');
+        }
+
+        // Neuter Phaser Camera shake functions in libraries
+        patched = patched
+            .replace(/shake\s*:\s*function\s*\([^)]*\)\s*\{/g, 'shake:function(){return;')
+            .replace(/shake\s*\([^)]*\)\s*\{/g, 'shake(){return;');
+
+        return patched;
     }
 
-    // 1. Intercept dynamic fetch/bundles
-    const originalFetch = window.fetch;
+    // 1. Intercept network fetch requests
+    const origFetch = window.fetch;
     window.fetch = async function(...args) {
-        const response = await originalFetch.apply(this, args);
-        const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
-
-        if (url.includes('/build/js/index-') || url.includes('/build/js/libraries-') || url.includes('libraries.js') || url.includes('index.js')) {
-            const text = await response.text();
+        const res = await origFetch.apply(this, args);
+        const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+        if (url.includes('index-') || url.includes('libraries-') || url.includes('index.js') || url.includes('libraries.js')) {
+            const text = await res.text();
             return new Response(patchGameSource(text), {
-                status: response.status,
-                statusText: response.statusText,
-                headers: response.headers
+                status: res.status,
+                statusText: res.statusText,
+                headers: res.headers
             });
         }
-        return response;
+        return res;
     };
 
-    // 2. Intercept static script elements before browser executes them
-    const observer = new MutationObserver(mutations => {
-        for (const m of mutations) {
-            for (const node of m.addedNodes) {
-                if (node.tagName === 'SCRIPT' && node.src) {
-                    if (node.src.includes('/build/js/index-') || node.src.includes('/build/js/libraries-') || node.src.includes('libraries.js') || node.src.includes('index.js')) {
-                        const originalSrc = node.src;
-                        node.removeAttribute('src');
+    // 2. Intercept static script elements synchronously
+    function processScript(node) {
+        if (node.tagName === 'SCRIPT' && node.src && !node._ttPatched) {
+            const src = node.src;
+            if (src.includes('index-') || src.includes('libraries-') || src.includes('index.js') || src.includes('libraries.js')) {
+                node._ttPatched = true;
+                node.removeAttribute('src');
+                try {
+                    const xhr = new XMLHttpRequest();
+                    xhr.open('GET', src, false);
+                    xhr.send();
+                    node.textContent = patchGameSource(xhr.responseText);
+                    console.log('%c[ShakeRemover] Successfully zeroed shake in: ' + src, 'color:#00ff00;font-weight:bold;');
+                } catch (e) {
+                    node.src = src;
+                }
+            }
+        }
+    }
 
-                        const xhr = new XMLHttpRequest();
-                        xhr.open('GET', originalSrc, false); // Synchronous fetch to keep load order intact
-                        try {
-                            xhr.send();
-                            node.textContent = patchGameSource(xhr.responseText);
-                        } catch (e) {
-                            node.src = originalSrc;
-                        }
-                    }
+    // Catch scripts already parsed in DOM
+    document.querySelectorAll('script[src]').forEach(processScript);
+
+    // Catch scripts added dynamically during startup
+    const obs = new MutationObserver(mutations => {
+        for (const m of mutations) {
+            for (const n of m.addedNodes) {
+                processScript(n);
+                if (n.querySelectorAll) {
+                    n.querySelectorAll('script[src]').forEach(processScript);
                 }
             }
         }
     });
+    obs.observe(document.documentElement, { childList: true, subtree: true });
 
-    observer.observe(document.documentElement, {
-        childList: true,
-        subtree: true
-    });
+    // 3. Fallback: freeze camera shake method if Phaser is instantiated
+    setInterval(() => {
+        if (window.Phaser?.Camera?.prototype) {
+            window.Phaser.Camera.prototype.shake = function() {};
+        }
+    }, 50);
 })();
